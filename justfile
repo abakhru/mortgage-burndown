@@ -11,14 +11,22 @@ install:
 
 # Run the web app (http://127.0.0.1:5000)
 run:
-    uv run python main.py
+    uv run python -m mortgage_burndown
 
 alias dev := run
 
+# Ruff lint (no writes)
+lint:
+    uv run ruff check src
+
+# Ruff lint with auto-fix
+fix:
+    uv run ruff check --fix src
+
 # Byte-compile and import smoke test
 check:
-    uv run python -m compileall -q .
-    uv run python -c "from app import app; from mortgage import calculate_mortgage; print('ok')"
+    uv run python -m compileall -q src
+    uv run python -c "from mortgage_burndown.app import app; from mortgage_burndown.mortgage import calculate_mortgage; print('ok')"
 
 # Refresh uv.lock from pyproject.toml and sync
 lock:

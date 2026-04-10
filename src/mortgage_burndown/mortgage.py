@@ -22,9 +22,7 @@ def payment_date_for_month_index(start: date, month_index: int) -> date:
     return add_months(start, month_index - 1)
 
 
-def payment_month_index_for_date(
-    start: date, event: date, *, max_months: int
-) -> int | None:
+def payment_month_index_for_date(start: date, event: date, *, max_months: int) -> int | None:
     """
     Map a calendar date to the 1-based payment month: first payment whose date is on or after
     ``event``. Returns None if every payment in the schedule is strictly before ``event``.
@@ -35,6 +33,46 @@ def payment_month_index_for_date(
         if payment_date_for_month_index(start, m) >= event:
             return m
     return None
+
+
+def count_payments_made(first_payment: date, as_of: date) -> int:
+    """How many monthly payments have been made from first_payment up to as_of (inclusive)."""
+    if as_of < first_payment:
+        return 0
+    m = (as_of.year - first_payment.year) * 12 + (as_of.month - first_payment.month)
+    pay_day = min(first_payment.day, calendar.monthrange(as_of.year, as_of.month)[1])
+    if as_of.day >= pay_day:
+        m += 1
+    return max(0, m)
+
+
+def last_payment_date_on_or_before(as_of: date, payment_day: int) -> date:
+    """Last EMI due date (on payment_day) that is considered paid per count_payments_made rules."""
+    d = min(payment_day, calendar.monthrange(as_of.year, as_of.month)[1])
+    if as_of.day >= d:
+        return date(as_of.year, as_of.month, d)
+    if as_of.month == 1:
+        y, m = as_of.year - 1, 12
+    else:
+        y, m = as_of.year, as_of.month - 1
+    d2 = min(payment_day, calendar.monthrange(y, m)[1])
+    return date(y, m, d2)
+
+
+def first_payment_date_for_payments_made(
+    as_of: date, payments_made: int, *, payment_day: int = 16
+) -> date:
+    """
+    First EMI date on ``payment_day`` such that ``count_payments_made(first, as_of) == payments_made``.
+
+    Used to seed a default loan start when the bank reports completed vs remaining term
+    (remaining = original_months - payments_made).
+    """
+    if payments_made <= 0:
+        d = min(payment_day, calendar.monthrange(as_of.year, as_of.month)[1])
+        return date(as_of.year, as_of.month, d)
+    last = last_payment_date_on_or_before(as_of, payment_day)
+    return add_months(last, -(payments_made - 1))
 
 
 def calculate_mortgage(
@@ -85,7 +123,10 @@ def calculate_mortgage(
 
         prep = prepayments.get(month, 0.0) or 0.0
         if prep > 0:
+            actual_prep = min(prep, balance)
             balance = max(0.0, balance - prep)
+        else:
+            actual_prep = 0.0
 
         new_r = rate_changes.get(month)
         if new_r is not None:
@@ -93,6 +134,19 @@ def calculate_mortgage(
             monthly_rate = current_annual / 12.0
 
         if balance <= 0:
+            if actual_prep > 0:
+                rows.append(
+                    {
+                        "Month": month,
+                        "Year": year,
+                        "Payment": 0.0,
+                        "Prepayment": round(actual_prep, 2),
+                        "Principal": 0.0,
+                        "Interest": 0.0,
+                        "Balance": 0.0,
+                        "Rate (%)": round(current_annual * 100, 4),
+                    }
+                )
             break
 
         interest_payment = balance * monthly_rate
@@ -103,7 +157,6 @@ def calculate_mortgage(
             monthly_payment = interest_payment + principal_payment
             balance = 0.0
         elif principal_payment < 0:
-            # Interest exceeds fixed payment: balance grows (negative amortization).
             monthly_payment = fixed_payment
             balance -= principal_payment
         else:
@@ -115,6 +168,7 @@ def calculate_mortgage(
                 "Month": month,
                 "Year": year,
                 "Payment": round(monthly_payment, 2),
+                "Prepayment": round(actual_prep, 2),
                 "Principal": round(principal_payment, 2),
                 "Interest": round(interest_payment, 2),
                 "Balance": round(max(0.0, balance), 2),
@@ -126,3 +180,35 @@ def calculate_mortgage(
             break
 
     return pd.DataFrame(rows)
+
+
+def balance_after_n_payments(
+    principal: float,
+    annual_rate: float,
+    years: int,
+    *,
+    months_total: int | None = None,
+    rate_changes: dict[int, float] | None = None,
+    prepayments: dict[int, float] | None = None,
+    n_payments: int,
+) -> float:
+    """
+    Outstanding principal after ``n_payments`` EMIs on the full-loan schedule (month 1 = first EMI).
+
+    ``n_payments`` = 0 means before any payment (returns ``principal``). If the loan pays off in
+    fewer than ``n_payments`` rows, uses the last balance in the schedule.
+    """
+    if n_payments <= 0:
+        return float(principal)
+    df = calculate_mortgage(
+        principal,
+        annual_rate,
+        years,
+        months_total=months_total,
+        rate_changes=rate_changes,
+        prepayments=prepayments,
+    )
+    if df.empty:
+        return max(0.0, float(principal))
+    take = min(n_payments, len(df))
+    return float(df.iloc[take - 1]["Balance"])

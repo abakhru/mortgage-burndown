@@ -175,12 +175,6 @@
 
     .field { margin-bottom: 0.85rem; }
 
-    .row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 0.85rem;
-    }
-
     input[type="number"],
     input[type="text"],
     input[type="date"],
@@ -297,6 +291,59 @@
     .mini-table .btn-row-del:hover {
       color: #f87171;
       background: rgba(248, 113, 113, 0.12);
+    }
+
+    /* Prepayment amount: full form-field treatment, wide column for large amounts */
+    .prepay-table td:nth-child(1) {
+      width: 1%;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+
+    .prepay-table td:nth-child(2) {
+      min-width: min(100%, 18rem);
+      width: 70%;
+    }
+
+    .prepay-table td:nth-child(3) {
+      width: 1%;
+      vertical-align: middle;
+    }
+
+    .prepay-table .prepay-amount-input {
+      width: 100%;
+      min-width: 14rem;
+      max-width: 28rem;
+      border: 1px solid var(--stroke-strong) !important;
+      background: rgba(2, 6, 23, 0.55) !important;
+      color: var(--text) !important;
+      font-size: 0.94rem;
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+      padding: 0.65rem 0.85rem !important;
+      border-radius: var(--radius-sm);
+      box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.1) inset;
+    }
+
+    .prepay-table .prepay-amount-input:hover {
+      border-color: rgba(148, 163, 184, 0.35) !important;
+      background: rgba(2, 6, 23, 0.62) !important;
+    }
+
+    .prepay-table .prepay-amount-input:focus {
+      outline: none !important;
+      border-color: rgba(56, 189, 248, 0.55) !important;
+      box-shadow: 0 0 0 3px var(--accent-dim) !important;
+      background: rgba(2, 6, 23, 0.68) !important;
+    }
+
+    .prepay-table .prepay-amount-input::placeholder {
+      color: var(--muted2);
+    }
+
+    .prepay-wrap.mini-wrap {
+      border-color: rgba(56, 189, 248, 0.2);
+      background: rgba(2, 6, 23, 0.42);
     }
 
     .btn-ghost {
@@ -517,7 +564,7 @@
     <header class="hero">
       <p class="eyebrow">Amortization</p>
       <h1>Mortgage burndown</h1>
-      <p class="sub">Set a <strong>first payment date</strong> to model <strong>prepayments</strong> and <strong>rate changes</strong> on specific calendar dates (mapped to the next scheduled payment on or after that date). The schedule and chart use those dates when set. <strong>Currency</strong> is display-only.</p>
+      <p class="sub">Set a <strong>loan start date</strong> to auto-compute payments made and remaining months. Model future <strong>prepayments</strong> and <strong>rate changes</strong> on specific calendar dates. <strong>Currency</strong> is display-only.</p>
     </header>
 
     <div class="layout">
@@ -537,21 +584,15 @@
           <p id="currency-hint" class="hint">Chart and labels use this symbol; enter amounts in that currency.</p>
         </div>
 
-        <div class="row">
-          <div class="field" style="margin-bottom:0;">
-            <label for="principal">Balance / principal</label>
-            <input id="principal" name="principal" type="number" step="1" min="1" value="{{ principal }}" required />
-          </div>
-          <div class="field" style="margin-bottom:0;">
-            <label for="years">Term (years)</label>
-            <input id="years" name="years" type="number" step="1" min="1" max="50" value="{{ years }}" required />
-          </div>
+        <div class="field">
+          <label for="original_principal">Original principal (disbursement)</label>
+          <input id="original_principal" name="original_principal" type="number" step="1" min="1" required value="{% if original_principal is not none %}{{ original_principal|int }}{% endif %}" />
+          <p class="hint">Loan amount at disbursement. Outstanding principal is <strong>calculated by the app</strong> from this, EMIs to date, and rate/prepayment history (see stats on the right).</p>
         </div>
 
         <div class="field">
-          <label for="remaining_months">Remaining term (months)</label>
-          <input id="remaining_months" name="remaining_months" type="number" step="1" min="1" max="600" placeholder="e.g. 177" value="{{ remaining_months }}" />
-          <p class="hint">If set, this fixes the schedule length and overrides Term (years)—use for a loan mid-way (e.g. current balance with <strong>177</strong> payments left). Leave blank for a new loan from payment 1.</p>
+          <label for="years">Term (years)</label>
+          <input id="years" name="years" type="number" step="1" min="1" max="50" value="{{ years }}" required />
         </div>
 
         <div class="field">
@@ -560,9 +601,9 @@
         </div>
 
         <div class="field">
-          <label for="start_date">First payment date (optional)</label>
-          <input id="start_date" name="start_date" type="date" value="{{ start_date }}" />
-          <p class="hint">Month 1 is this date; following months advance by calendar month. Leave blank for a “years since start” chart only.</p>
+          <label for="loan_start_date">Loan start date (first EMI)</label>
+          <input id="loan_start_date" name="loan_start_date" type="date" value="{{ loan_start_date }}" />
+          <p class="hint">Date of the first EMI. The app derives payments made to today, remaining term, and the calendar for the amortization table (next EMI onward).</p>
         </div>
 
         <p class="section-title">Rate change (effective date)</p>
@@ -584,14 +625,14 @@
 
         <p class="section-title">Prepayment (effective date)</p>
         <p class="section-blurb">One-off lump sum on the first payment on or after this date (before that month’s payment). The <strong>monthly payment stays fixed</strong>; the balance drops so more goes to principal each month.</p>
-        <div class="mini-wrap">
-          <table class="mini-table" id="prepay-rows">
+        <div class="mini-wrap prepay-wrap">
+          <table class="mini-table prepay-table" id="prepay-rows">
             <thead><tr><th>Effective date</th><th>Amount ({{ currency.symbol }})</th><th></th></tr></thead>
             <tbody>
               {% for d, v in prepay_rows %}
               <tr>
                 <td><input name="prepay_date[]" type="date" value="{{ d }}" /></td>
-                <td><input name="prepay_value[]" type="number" step="1" min="0" placeholder="e.g. 20000" value="{{ v }}" /></td>
+                <td><input class="prepay-amount-input" name="prepay_value[]" type="number" step="1" min="0" inputmode="numeric" autocomplete="off" placeholder="e.g. 500000" value="{{ v }}" /></td>
                 <td><button type="button" class="btn-row-del" aria-label="Remove prepayment row">Remove</button></td>
               </tr>
               {% endfor %}
@@ -607,10 +648,25 @@
         <section class="panel glass">
           <div class="stats">
             <div class="stat">
-              <span>Balance</span>
+              <span>Current principal balance</span>
               <strong>{{ principal_compact }}</strong>
-              <span class="stat-sub">Term {{ summary.term_months }} mo</span>
+              {% if original_principal_compact %}
+              {% if summary.months_paid > 0 %}
+              <span class="stat-sub">After {{ summary.months_paid }} payment{% if summary.months_paid != 1 %}s{% endif %} · from original {{ original_principal_compact }}</span>
+              {% else %}
+              <span class="stat-sub">Same as original {{ original_principal_compact }} · no payments yet</span>
+              {% endif %}
+              {% else %}
+              <span class="stat-sub">Original term {{ summary.total_term }} mo</span>
+              {% endif %}
             </div>
+            {% if summary.months_paid > 0 %}
+            <div class="stat">
+              <span>Payments made</span>
+              <strong>{{ summary.months_paid }} mo</strong>
+              <span class="stat-sub">{{ summary.months_paid }} of {{ summary.total_term }} mo</span>
+            </div>
+            {% endif %}
             <div class="stat">
               <span>Payments remaining</span>
               <strong>{{ summary.payments_remaining_display }} mo</strong>
@@ -641,28 +697,31 @@
             <p class="section-title">Amortization schedule</p>
             <span class="schedule-tag">Scroll</span>
           </div>
+          {% if schedule_blurb %}
+          <p class="section-blurb" style="margin:0 0 0.75rem;">{{ schedule_blurb }}</p>
+          {% endif %}
           <div class="table-scroll">{{ table_html | safe }}</div>
         </section>
 
         {% if yearly_interest_rows %}
         <section class="panel glass">
           <div class="schedule-head">
-            <p class="section-title">Interest by loan year</p>
+            <p class="section-title">{% if yearly_interest_by_calendar %}Interest by calendar year{% else %}Interest by loan year{% endif %}</p>
             <span class="schedule-tag">Yearly</span>
           </div>
-          <p class="section-blurb" style="margin:0 0 0.75rem;">Each row is the sum of monthly interest for that loan year (year 1 = payments 1–12, etc.).</p>
+          <p class="section-blurb" style="margin:0 0 0.75rem;">{% if yearly_interest_by_calendar %}Each row is total interest paid in that calendar year (by payment date).{% else %}Set a first payment date or loan start date for a calendar-year breakdown. Showing loan-year buckets (year 1 = payments 1–12, etc.).{% endif %}</p>
           <div class="table-scroll" style="max-height: min(40vh, 360px);">
             <table class="data-table">
               <thead>
                 <tr>
-                  <th>Loan year</th>
+                  <th>{% if yearly_interest_by_calendar %}Calendar year{% else %}Loan year{% endif %}</th>
                   <th>Interest paid</th>
                 </tr>
               </thead>
               <tbody>
-                {% for loan_year, interest_display in yearly_interest_rows %}
+                {% for year_label, interest_display in yearly_interest_rows %}
                 <tr>
-                  <td>{{ loan_year }}</td>
+                  <td>{{ year_label }}</td>
                   <td>{{ interest_display }}</td>
                 </tr>
                 {% endfor %}
@@ -695,7 +754,7 @@
     function prepayRowHtml() {
       return (
         "<td><input name=\"prepay_date[]\" type=\"date\" /></td>" +
-        "<td><input name=\"prepay_value[]\" type=\"number\" step=\"1\" min=\"0\" placeholder=\"Amount\" /></td>" +
+        "<td><input class=\"prepay-amount-input\" name=\"prepay_value[]\" type=\"number\" step=\"1\" min=\"0\" inputmode=\"numeric\" autocomplete=\"off\" placeholder=\"e.g. 500000\" /></td>" +
         "<td><button type=\"button\" class=\"btn-row-del\" aria-label=\"Remove prepayment row\">Remove</button></td>"
       );
     }

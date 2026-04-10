@@ -3,19 +3,30 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 from flask import Flask, render_template, request
 
-from currency import CURRENCIES, Currency, DEFAULT_CURRENCY_CODE, format_compact_amount, get_currency
-from mortgage import (
+from mortgage_burndown.currency import (
+    CURRENCIES,
+    DEFAULT_CURRENCY_CODE,
+    Currency,
+    format_compact_amount,
+    get_currency,
+)
+from mortgage_burndown.mortgage import (
+    balance_after_n_payments,
     calculate_mortgage,
+    count_payments_made,
+    first_payment_date_for_payments_made,
     payment_date_for_month_index,
     payment_month_index_for_date,
 )
 
-app = Flask(__name__)
+_ROOT = Path(__file__).resolve().parent.parent.parent
+app = Flask(__name__, template_folder=str(_ROOT / "templates"))
 
 _CURRENCY_OPTIONS = sorted(CURRENCIES.items(), key=lambda kv: kv[1].label)
 
@@ -78,19 +89,28 @@ def _chart_html(df, c: Currency, *, has_dates: bool) -> str:
     return fig.to_html(full_html=False, include_plotlyjs="cdn", config={"displayModeBar": True})
 
 
-def _table_html(df, c: Currency) -> str:
+def _table_html(df, c: Currency, *, has_prepayments: bool) -> str:
     sym = c.symbol
     rename = {
         "Payment": f"Payment ({sym})",
+        "Prepayment": f"Prepayment ({sym})",
         "Principal": f"Principal ({sym})",
         "Interest": f"Interest ({sym})",
         "Balance": f"Balance ({sym})",
     }
     out = df.rename(columns=rename)
+    if not has_prepayments and f"Prepayment ({sym})" in out.columns:
+        out = out.drop(columns=[f"Prepayment ({sym})"])
     cols = list(out.columns)
+    lead: list[str] = []
+    if "Payment #" in cols:
+        cols.remove("Payment #")
+        lead.append("Payment #")
     if "Payment date" in cols:
         cols.remove("Payment date")
-        out = out[["Payment date"] + cols]
+        lead.append("Payment date")
+    if lead:
+        out = out[lead + cols]
     return out.to_html(
         classes="data-table",
         index=False,
@@ -99,19 +119,68 @@ def _table_html(df, c: Currency) -> str:
     )
 
 
-def _yearly_interest_rows(df: pd.DataFrame, c: Currency) -> list[tuple[int, str]]:
-    """Loan year (1-based) -> display string for sum of interest that year."""
-    if df is None or len(df) == 0 or "Year" not in df.columns:
-        return []
+def _yearly_interest_rows(
+    df: pd.DataFrame,
+    c: Currency,
+    *,
+    payment_anchor: date | None,
+) -> tuple[list[tuple[int, str]], bool]:
+    """
+    Sum interest by calendar year when payment dates or a first-payment anchor exist;
+    otherwise fall back to loan-year buckets (Year column).
+    Second value is True when rows use calendar years.
+    """
+    if df is None or len(df) == 0 or "Interest" not in df.columns:
+        return [], True
+
+    if "Payment date" in df.columns:
+        years = pd.to_datetime(df["Payment date"], format="%Y-%m-%d").dt.year
+        tmp = df.copy()
+        tmp["_cal_year"] = years
+        agg = tmp.groupby("_cal_year", sort=True)["Interest"].sum()
+        rows = [(int(y), format_compact_amount(float(t), c)) for y, t in agg.items()]
+        return rows, True
+
+    if payment_anchor is not None:
+        years = pd.Series(
+            [payment_date_for_month_index(payment_anchor, int(m)).year for m in df["Month"]],
+            index=df.index,
+        )
+        tmp = df.copy()
+        tmp["_cal_year"] = years
+        agg = tmp.groupby("_cal_year", sort=True)["Interest"].sum()
+        rows = [(int(y), format_compact_amount(float(t), c)) for y, t in agg.items()]
+        return rows, True
+
+    if "Year" not in df.columns:
+        return [], True
     agg = df.groupby("Year", sort=True)["Interest"].sum()
-    return [(int(y), format_compact_amount(float(t), c)) for y, t in agg.items()]
+    rows = [(int(y), format_compact_amount(float(t), c)) for y, t in agg.items()]
+    return rows, False
 
 
 DEFAULTS = {
-    "principal": 7_500_000,
+    # Disbursement / original loan amount; current balance is derived after payments to date when set.
+    "original_principal": 7_500_000,
     "years": 20,
     "rate_pct": 8.35,
+    # Bank “completed term” (months paid); seeds default first EMI date (with reference date below).
+    "months_completed": 63,
+    "payment_day": 16,
 }
+
+# Calendar date when the bank reported completed vs remaining term; used only to derive the
+# default first EMI so remaining = years×12 − count_payments_made(first_emi, today) without
+# hardcoding a “remaining months” number.
+REFERENCE_AS_OF_BANK = date(2026, 4, 9)
+
+
+def _default_first_emi_date() -> date:
+    return first_payment_date_for_payments_made(
+        REFERENCE_AS_OF_BANK,
+        DEFAULTS["months_completed"],
+        payment_day=DEFAULTS["payment_day"],
+    )
 
 
 def _parse_start_date(raw: str | None) -> date | None:
@@ -121,6 +190,37 @@ def _parse_start_date(raw: str | None) -> date | None:
         return datetime.strptime(raw.strip()[:10], "%Y-%m-%d").date()
     except ValueError:
         return None
+
+
+def _schedule_start_date(loan_start_d: date | None, months_paid: int) -> date | None:
+    """First payment date of the forward schedule (month 1): next EMI after completed payments."""
+    if loan_start_d is None:
+        return None
+    if months_paid <= 0:
+        return loan_start_d
+    return payment_date_for_month_index(loan_start_d, months_paid + 1)
+
+
+def _schedule_blurb(
+    loan_start_d: date | None,
+    months_paid: int,
+    start_d: date | None,
+    *,
+    has_rows: bool,
+) -> str | None:
+    """Explain that the table is remaining payments; first row is next due date when loan is in progress."""
+    if not has_rows or loan_start_d is None or start_d is None:
+        return None
+    first = loan_start_d.isoformat()
+    nxt = start_d.isoformat()
+    if months_paid <= 0:
+        return (
+            f"Payment dates begin at your first EMI ({first}). Each row is one scheduled payment from today’s balance."
+        )
+    return (
+        f"First EMI was {first}. You have already made {months_paid} payment(s); "
+        f"the first row below is your next due date ({nxt}), not the original first payment."
+    )
 
 
 def _parse_event_dates(
@@ -165,37 +265,93 @@ def _parse_event_dates(
 @app.route("/", methods=["GET", "POST"])
 def index():
     form_error: str | None = None
+    months_paid: int = 0
     if request.method == "POST":
-        principal = float(request.form.get("principal", DEFAULTS["principal"]))
+        original_raw = (request.form.get("original_principal") or "").strip()
+        if not original_raw:
+            form_error = form_error or "Original principal is required."
+            original_principal_in = float(DEFAULTS["original_principal"])
+        else:
+            try:
+                original_principal_in = float(original_raw)
+                if original_principal_in <= 0:
+                    form_error = form_error or "Original principal must be a positive number."
+                    original_principal_in = float(DEFAULTS["original_principal"])
+            except ValueError:
+                form_error = form_error or "Original principal must be a valid number."
+                original_principal_in = float(DEFAULTS["original_principal"])
         years = int(request.form.get("years", DEFAULTS["years"]))
         rate_pct = float(request.form.get("rate_pct", DEFAULTS["rate_pct"]))
         annual_rate = rate_pct / 100.0
 
         rd = request.form.getlist("rate_date[]")
         rv = request.form.getlist("rate_value[]")
-        pd = request.form.getlist("prepay_date[]")
+        prep_dates = request.form.getlist("prepay_date[]")
         pv = request.form.getlist("prepay_value[]")
 
-        remaining_months_raw = (request.form.get("remaining_months") or "").strip()
-        if remaining_months_raw:
-            try:
-                months_total = max(1, min(600, int(float(remaining_months_raw))))
-            except ValueError:
-                months_total = years * 12
-                if not form_error:
-                    form_error = "Remaining term (months) must be a valid number."
+        loan_start_raw = request.form.get("loan_start_date") or ""
+        loan_start_d = _parse_start_date(loan_start_raw)
+        today = date.today()
+
+        if loan_start_d is not None and loan_start_d <= today:
+            total_term = years * 12
+            months_paid = count_payments_made(loan_start_d, today)
+        else:
+            months_paid = 0
+
+        if months_paid > 0:
+            months_total = max(1, years * 12 - months_paid)
         else:
             months_total = years * 12
 
-        start_date_raw = request.form.get("start_date") or ""
-        start_d = _parse_start_date(start_date_raw)
+        start_d = _schedule_start_date(loan_start_d, months_paid)
 
-        rate_changes, err_r = _parse_event_dates(rd, rv, start_d=start_d, months_total=months_total, as_rate=True)
-        prepayments, err_p = _parse_event_dates(pd, pv, start_d=start_d, months_total=months_total, as_rate=False)
-        form_error = err_r or err_p or form_error
+        principal = float(original_principal_in)
+        if loan_start_d is not None:
+            hist_rc, err_hr = _parse_event_dates(
+                rd, rv, start_d=loan_start_d, months_total=years * 12, as_rate=True
+            )
+            hist_pp, err_hp = _parse_event_dates(
+                prep_dates, pv, start_d=loan_start_d, months_total=years * 12, as_rate=False
+            )
+            form_error = err_hr or err_hp or form_error
+            if not form_error:
+                if months_paid <= 0:
+                    principal = original_principal_in
+                else:
+                    principal = balance_after_n_payments(
+                        original_principal_in,
+                        annual_rate,
+                        years,
+                        months_total=years * 12,
+                        rate_changes=hist_rc,
+                        prepayments=hist_pp,
+                        n_payments=months_paid,
+                    )
+        # No first EMI yet: current balance equals original disbursement.
+        else:
+            principal = original_principal_in
+
+        rate_changes: dict[int, float] = {}
+        prepayments: dict[int, float] = {}
+        if start_d is not None:
+            rate_changes, err_r = _parse_event_dates(
+                rd, rv, start_d=start_d, months_total=months_total, as_rate=True
+            )
+            prepayments, err_p = _parse_event_dates(
+                prep_dates, pv, start_d=start_d, months_total=months_total, as_rate=False
+            )
+            form_error = err_r or err_p or form_error
+        else:
+            if any((d or "").strip() or (v or "").strip() for d, v in zip(rd, rv)) or any(
+                (d or "").strip() or (v or "").strip() for d, v in zip(prep_dates, pv)
+            ):
+                form_error = form_error or (
+                    "Set loan start date (first EMI) to use rate changes or prepayments on specific dates."
+                )
 
         rate_rows = list(zip(rd, rv)) if rd else [("", "")]
-        prepay_rows = list(zip(pd, pv)) if pd else [("", "")]
+        prepay_rows = list(zip(prep_dates, pv)) if prep_dates else [("", "")]
         if not rate_rows:
             rate_rows = [("", "")]
         if not prepay_rows:
@@ -204,35 +360,52 @@ def index():
         raw_cc = (request.form.get("currency") or DEFAULT_CURRENCY_CODE).strip().upper()
         currency_code = raw_cc if raw_cc in CURRENCIES else DEFAULT_CURRENCY_CODE
         ctx = {
+            "original_principal": original_principal_in,
             "principal": principal,
             "years": years,
             "rate_pct": rate_pct,
             "rate_rows": rate_rows,
             "prepay_rows": prepay_rows,
             "currency_code": currency_code,
-            "start_date": start_date_raw,
+            "loan_start_date": loan_start_raw,
             "form_error": form_error,
-            "remaining_months": remaining_months_raw,
         }
     else:
-        principal = DEFAULTS["principal"]
         years = DEFAULTS["years"]
         rate_pct = DEFAULTS["rate_pct"]
         annual_rate = rate_pct / 100.0
         rate_changes: dict[int, float] = {}
         prepayments: dict[int, float] = {}
         form_error = None
-        months_total = years * 12
+        today = date.today()
+        loan_start_d = _default_first_emi_date()
+        loan_start_raw = loan_start_d.isoformat()
+        months_paid = count_payments_made(loan_start_d, today)
+        total_term_months = years * 12
+        months_total = max(1, total_term_months - months_paid)
+        original_principal = float(DEFAULTS["original_principal"])
+        if months_paid <= 0:
+            principal = original_principal
+        else:
+            principal = balance_after_n_payments(
+                original_principal,
+                annual_rate,
+                years,
+                months_total=years * 12,
+                rate_changes={},
+                prepayments={},
+                n_payments=months_paid,
+            )
         ctx = {
+            "original_principal": original_principal,
             "principal": principal,
             "years": years,
             "rate_pct": rate_pct,
             "rate_rows": [("", "")],
             "prepay_rows": [("", "")],
             "currency_code": DEFAULT_CURRENCY_CODE,
-            "start_date": "",
+            "loan_start_date": loan_start_raw,
             "form_error": form_error,
-            "remaining_months": "",
         }
 
     currency = get_currency(ctx.get("currency_code"))
@@ -293,52 +466,47 @@ def index():
             else:
                 rate_vs_fixed_sub = f"{-months_delta_rate} mo longer payoff · vs. starting rate only"
         else:
-            rate_vs_fixed_sub = (
-                "Same payoff length; positive = less interest vs. starting rate only"
-            )
+            rate_vs_fixed_sub = "Same payoff length; positive = less interest vs. starting rate only"
     else:
         rate_vs_fixed_display = "—"
         rate_vs_fixed_sub = ""
 
-    start_d = _parse_start_date(ctx.get("start_date"))
+    loan_start_d = _parse_start_date(ctx.get("loan_start_date"))
+    start_d = _schedule_start_date(loan_start_d, months_paid)
     if start_d is not None and len(df):
         df = df.copy()
-        df.insert(
-            0,
-            "Payment date",
-            [payment_date_for_month_index(start_d, int(m)).isoformat() for m in df["Month"]],
-        )
+        dates = [payment_date_for_month_index(start_d, int(m)).isoformat() for m in df["Month"]]
+        if loan_start_d is not None:
+            df.insert(0, "Payment #", [months_paid + int(m) for m in df["Month"]])
+            df.insert(1, "Payment date", dates)
+        else:
+            df.insert(0, "Payment date", dates)
 
     has_dates = start_d is not None and len(df) and "Payment date" in df.columns
-    table_html = _table_html(df, currency)
+    schedule_blurb = _schedule_blurb(
+        loan_start_d, months_paid, start_d, has_rows=bool(len(df))
+    )
+    table_html = _table_html(df, currency, has_prepayments=has_prep)
     chart = _chart_html(df, currency, has_dates=has_dates)
 
-    total_paid = float(df["Payment"].sum()) if len(df) else 0.0
+    total_regular = float(df["Payment"].sum()) if len(df) else 0.0
+    total_prepaid = float(df["Prepayment"].sum()) if len(df) and "Prepayment" in df.columns else 0.0
+    total_paid = total_regular + total_prepaid
     months_to_payoff = len(df)
-    raw_rm = (ctx.get("remaining_months") or "").strip()
-    if raw_rm:
-        try:
-            _ = max(1, min(600, int(float(raw_rm))))
-            has_stated_remaining = True
-        except ValueError:
-            has_stated_remaining = False
+
+    payments_remaining_display = months_total
+    yr_remaining = round(months_total / 12.0, 2)
+    if months_to_payoff < months_total:
+        payments_remaining_sub = f"~{yr_remaining} yr · early payoff at {months_to_payoff} mo"
     else:
-        has_stated_remaining = False
-    yr_payoff = round(months_to_payoff / 12.0, 2) if months_to_payoff else 0.0
-    if has_stated_remaining:
-        payments_remaining_display = months_total
-        if months_to_payoff != months_total:
-            payments_remaining_sub = (
-                f"Payoff in this model after {months_to_payoff} mo (~{yr_payoff} yr)"
-            )
-        else:
-            payments_remaining_sub = f"~{yr_payoff} yr · matches stated term"
-    else:
-        payments_remaining_display = months_to_payoff
-        payments_remaining_sub = f"~{yr_payoff} yr · Stated term {months_total} mo"
+        payments_remaining_sub = f"~{yr_remaining} yr"
+
+    total_term = years * 12
     summary = {
         "months": months_to_payoff,
         "term_months": months_total,
+        "total_term": total_term,
+        "months_paid": months_paid,
         "years_paid": round(months_to_payoff / 12.0, 2) if months_to_payoff else 0.0,
         "total_paid": total_paid,
         "payments_remaining_display": payments_remaining_display,
@@ -346,8 +514,13 @@ def index():
     }
     total_paid_display = format_compact_amount(total_paid, currency)
     principal_compact = format_compact_amount(principal, currency)
+    _op = ctx.get("original_principal")
+    original_principal_compact = format_compact_amount(float(_op), currency) if _op is not None else ""
 
-    yearly_interest_rows = _yearly_interest_rows(df, currency)
+    payment_anchor = start_d or loan_start_d
+    yearly_interest_rows, yearly_interest_by_calendar = _yearly_interest_rows(
+        df, currency, payment_anchor=payment_anchor
+    )
     total_interest = float(df["Interest"].sum()) if len(df) else 0.0
     yearly_interest_total_display = format_compact_amount(total_interest, currency)
 
@@ -355,10 +528,13 @@ def index():
         "index.html",
         chart_html=chart,
         table_html=table_html,
+        schedule_blurb=schedule_blurb,
         yearly_interest_rows=yearly_interest_rows,
+        yearly_interest_by_calendar=yearly_interest_by_calendar,
         yearly_interest_total_display=yearly_interest_total_display,
         summary=summary,
         principal_compact=principal_compact,
+        original_principal_compact=original_principal_compact,
         total_paid_display=total_paid_display,
         interest_saved_display=interest_saved_display,
         rate_vs_fixed_display=rate_vs_fixed_display,
